@@ -42,7 +42,6 @@ contract Voting is IForwarder, AragonApp {
     string private constant ERROR_DELEGATE_NOT_SET = "VOTING_DELEGATE_NOT_SET";
     string private constant ERROR_SELF_DELEGATE = "VOTING_SELF_DELEGATE";
     string private constant ERROR_DELEGATE_SAME_AS_PREV = "VOTING_DELEGATE_SAME_AS_PREV";
-    string private constant ERROR_DELEGATE_CANNOT_OVERWRITE_VOTE = "VOTING_DELEGATE_CANT_OVERWRITE";
     string private constant ERROR_CAN_NOT_VOTE_FOR_MULTIPLE = "VOTING_CAN_NOT_VOTE_FOR_MULTIPLE";
     string private constant ERROR_INVALID_OFFSET_OR_COUNT = "VOTING_INVALID_OFFSET_OR_COUNT";
 
@@ -97,7 +96,8 @@ contract Voting is IForwarder, AragonApp {
     event ChangeObjectionPhaseTime(uint64 objectionPhaseTime);
     event DelegateSet(address indexed voter, address indexed previousDelegate, address indexed newDelegate);
     event CastVoteAsDelegate(uint256 indexed voteId, address indexed delegate, address indexed voter, bool supports, uint256 stake);
-    event VoteForMultipleSkippedFor(uint256 indexed voteId, address indexed delegate, address indexed skippedVoter, bool supports);
+    event VoteForSkippedFor(uint256 indexed voteId, address indexed delegate, address[] voters, bool supports, uint256 totalStake);
+
 
     modifier voteExists(uint256 _voteId) {
         require(_voteId < votesLength, ERROR_NO_VOTE);
@@ -327,23 +327,46 @@ contract Voting is IForwarder, AragonApp {
         Vote storage vote_ = votes[_voteId];
         require(_isVoteOpen(vote_), ERROR_CAN_NOT_VOTE);
         require(_isProperPhaseToVote(_voteId, _supports), ERROR_CAN_NOT_VOTE);
-        require(_hasEnoughVotingPower(vote_, _voteFor), ERROR_CAN_NOT_VOTE);
-        require(_canVoteFor(msg.sender, _voteFor), ERROR_CAN_NOT_VOTE_FOR);
-        require(!_hasVoted(_voteId, _voteFor), ERROR_DELEGATE_CANNOT_OVERWRITE_VOTE);
-        _vote(_voteId, _supports, _voteFor, true);
+
+        address msgSender = msg.sender;
+        if (_canVoteFor(msgSender, _voteFor, _voteId)) {
+            _vote(_voteId, _supports, _voteFor, true);
+        } else {
+            address[] memory skippedVoters = new address[](1);
+            skippedVoters[0] = _voteFor;
+            uint256 skippedVotingPower = token.balanceOfAt(_voteFor, vote_.snapshotBlock);
+            emit VoteForSkippedFor(_voteId, msgSender, skippedVoters, _supports, skippedVotingPower);
+        }
     }
 
     function voteForMultiple(uint256 _voteId, bool _supports, address[] _voteForList) external voteExists(_voteId) {
         Vote storage vote_ = votes[_voteId];
+        require(_voteForList.length > 0, ERROR_CAN_NOT_VOTE_FOR_MULTIPLE);
         require(_isVoteOpen(vote_), ERROR_CAN_NOT_VOTE);
         require(_isProperPhaseToVote(_voteId, _supports), ERROR_CAN_NOT_VOTE);
 
+        address[] memory skippedVoters = new address[](_voteForList.length);
+        uint256 skippedVotersCount;
+        uint256 skippedVotingPower;
+
         for (uint256 i = 0; i < _voteForList.length; ++i) {
-            address voteFor_ = _voteForList[i];
-            require(_hasEnoughVotingPower(vote_, voteFor_), ERROR_CAN_NOT_VOTE);
-            require(_canVoteFor(msg.sender, voteFor_), ERROR_CAN_NOT_VOTE_FOR);
-            require(!_hasVoted(_voteId, voteFor_), ERROR_DELEGATE_CANNOT_OVERWRITE_VOTE);
-            _vote(_voteId, _supports, voteFor_, true);
+            if (_canVoteFor(msg.sender, _voteForList[i], _voteId)) {
+                _vote(_voteId, _supports, _voteForList[i], true);
+            } else {
+                skippedVoters[skippedVotersCount++] = _voteForList[i];
+                skippedVotingPower = skippedVotingPower.add(token.balanceOfAt(_voteForList[i], vote_.snapshotBlock));
+            }
+        }
+
+
+        if (skippedVotersCount == _voteForList.length) {
+            emit VoteForSkippedFor(_voteId, msg.sender, _voteForList, _supports, skippedVotingPower);
+        } else if (skippedVotersCount > 0) {
+            address[] memory skippedVotersTruncated = new address[](skippedVotersCount);
+            for (uint256 j = 0; j < skippedVotersCount; ++j) {
+                skippedVotersTruncated[j] = skippedVoters[j];
+            }
+            emit VoteForSkippedFor(_voteId, msg.sender, skippedVotersTruncated, _supports, skippedVotingPower);
         }
     }
 
@@ -610,10 +633,15 @@ contract Voting is IForwarder, AragonApp {
         return _isVoteOpen(vote_) && _hasEnoughVotingPower(vote_, _voter);
     }
 
-    function _canVoteFor(address _delegate, address _voter) internal view returns (bool) {
-        require(_delegate != address(0), ERROR_ZERO_ADDRESS_PASSED);
-        require(_voter != address(0), ERROR_ZERO_ADDRESS_PASSED);
+    function _isDelegateFor(address _delegate, address _voter) internal view returns (bool) {
+        if (_delegate == address(0) || _voter == address(0)) {
+            return false;
+        }
         return delegates[_voter].delegate == _delegate;
+    }
+
+    function _canVoteFor(address _delegate, address _voter, uint256 _voteId) internal view voteExists(_voteId) returns (bool) {
+        return _hasEnoughVotingPower(votes[_voteId], _voter) && _isDelegateFor(_delegate, _voter) && !_hasVoted(_voteId, _voter);
     }
 
     function _isProperPhaseToVote(uint256 _voteId, bool _supports) internal view returns (bool) {

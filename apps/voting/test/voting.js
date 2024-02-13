@@ -448,12 +448,21 @@ contract('Voting App', ([root, holder1, holder2, holder20, holder29, holder51, d
         assertAmountOfEvents(tx, 'CastVote', {expectedAmount: 1})
         assertAmountOfEvents(tx, 'CastObjection', {expectedAmount: 0})
         assertAmountOfEvents(tx, 'CastVoteAsDelegate', {expectedAmount: 1})
+        assertAmountOfEvents(tx, 'VoteForSkippedFor', {expectedAmount: 0})
 
         const state = await voting.getVote(voteId)
         const voterState = await voting.getVoterState(voteId, holder29)
 
         assertBn(state[7], bigExp(29, decimals), 'nay vote should have been counted')
         assert.equal(voterState, VOTER_STATE.DELEGATE_NAY, 'holder29 should have delegate nay voter status')
+      })
+
+      it(`voteFor won't revert even if vote failed`, async () => {
+        const tx = await voting.voteFor(voteId, false, holder20, {from: delegate1})
+        assertEvent(tx, 'VoteForSkippedFor', {expectedArgs: {voteId: voteId, delegate: delegate1, supports: false}})
+        assertAmountOfEvents(tx, 'VoteForSkippedFor', {expectedAmount: 1})
+        const skippedVoters = getEventArgument(tx, 'VoteForSkippedFor', 'voters')
+        assertArraysEqualAsSets(skippedVoters, [holder20], 'should have skipped holder20')
       })
 
       it('delegate can vote for both voters', async () => {
@@ -465,6 +474,7 @@ contract('Voting App', ([root, holder1, holder2, holder20, holder29, holder51, d
         assertAmountOfEvents(tx, 'CastVote', {expectedAmount: 2})
         assertAmountOfEvents(tx, 'CastObjection', {expectedAmount: 0})
         assertAmountOfEvents(tx, 'CastVoteAsDelegate', {expectedAmount: 2})
+        assertAmountOfEvents(tx, 'VoteForSkippedFor', {expectedAmount: 0})
 
         const state = await voting.getVote(voteId)
         assertBn(state[7], bigExp(80, decimals), 'nay vote should have been counted')
@@ -476,12 +486,20 @@ contract('Voting App', ([root, holder1, holder2, holder20, holder29, holder51, d
         assert.equal(voterState51, VOTER_STATE.DELEGATE_NAY, 'holder51 should have delegate nay voter status')
       })
 
-      it(`delegate can't vote for both voters if one has previously voted`, async () => {
-        await voting.vote(voteId, false, true, { from: holder29 })
-        await assertRevert(
-          voting.voteForMultiple(voteId, false, [holder29, holder51], {from: delegate1}),
-          ERRORS.VOTING_DELEGATE_CANT_OVERWRITE
-        )
+      it(`delegate can vote for multiple even if some voters aren't valid`, async () => {
+        const tx = await voting.voteForMultiple(voteId, false, [holder29, holder1, holder51], {from: delegate1})
+        assertEvent(tx, 'CastVote', {expectedArgs: {voteId: voteId, voter: holder29, supports: false}})
+        assertEvent(tx, 'CastVote', {index: 1, expectedArgs: {voteId: voteId, voter: holder51, supports: false}})
+        assertEvent(tx, 'CastVoteAsDelegate', {expectedArgs: {voteId: voteId, delegate: delegate1, voter: holder29, supports: false}})
+        assertEvent(tx, 'CastVoteAsDelegate', {index: 1, expectedArgs: {voteId: voteId, delegate: delegate1, voter: holder51, supports: false}})
+        assertAmountOfEvents(tx, 'CastVote', {expectedAmount: 2})
+        assertAmountOfEvents(tx, 'CastObjection', {expectedAmount: 0})
+        assertAmountOfEvents(tx, 'CastVoteAsDelegate', {expectedAmount: 2})
+
+        assertEvent(tx, 'VoteForSkippedFor', {expectedArgs: {voteId: voteId, delegate: delegate1, supports: false}})
+        assertAmountOfEvents(tx, 'VoteForSkippedFor', {expectedAmount: 1})
+        const skippedVoters = getEventArgument(tx, 'VoteForSkippedFor', 'voters')
+        assertArraysEqualAsSets(skippedVoters, [holder1], 'should have skipped holder1')
       })
 
       it(`voter can overwrite delegate's vote`, async () => {
@@ -504,14 +522,11 @@ contract('Voting App', ([root, holder1, holder2, holder20, holder29, holder51, d
         await voting.voteFor(voteId, false, holder29, {from: delegate1})
         await voting.vote(voteId, true, true, {from: holder29})
 
-        await assertRevert(
-            voting.voteFor(
-                voteId,
-                false,
-                holder29,
-                { from: delegate1 }
-            ), ERRORS.VOTING_DELEGATE_CANT_OVERWRITE
-        )
+        const tx = await voting.voteFor(voteId, false, holder29, {from: delegate1})
+        assertEvent(tx, 'VoteForSkippedFor', {expectedArgs: {voteId: voteId, delegate: delegate1, supports: false}})
+        assertAmountOfEvents(tx, 'VoteForSkippedFor', {expectedAmount: 1})
+        const skippedVoters = getEventArgument(tx, 'VoteForSkippedFor', 'voters')
+        assertArraysEqualAsSets(skippedVoters, [holder29], 'should have skipped holder29')
       })
     })
   }
