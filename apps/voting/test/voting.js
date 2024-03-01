@@ -1,4 +1,5 @@
 const ERRORS = require('./helpers/errors')
+const assertArraysEqualAsSets = require('./helpers/assertArrayAsSets')
 const { assertBn, assertRevert, assertAmountOfEvents, assertEvent } = require('@aragon/contract-helpers-test/src/asserts')
 const { pct16, bn, bigExp, getEventArgument, ZERO_ADDRESS } = require('@aragon/contract-helpers-test')
 const { newDao, installNewApp, encodeCallScript, ANY_ENTITY, EMPTY_CALLS_SCRIPT } = require('@aragon/contract-helpers-test/src/aragon-os')
@@ -11,13 +12,12 @@ const ExecutionTarget = artifacts.require('ExecutionTarget')
 
 const createdVoteId = receipt => getEventArgument(receipt, 'StartVote', 'voteId')
 
-const VOTER_STATE = ['ABSENT', 'YEA', 'NAY'].reduce((state, key, index) => {
+const VOTER_STATE = ['ABSENT', 'YEA', 'NAY', 'DELEGATE_YEA', 'DELEGATE_NAY'].reduce((state, key, index) => {
   state[key] = index;
   return state;
 }, {})
 
-
-contract('Voting App', ([root, holder1, holder2, holder20, holder29, holder51, nonHolder]) => {
+contract('Voting App', ([root, holder1, holder2, holder20, holder29, holder51, delegate1, delegate2, nonHolder]) => {
   let votingBase, voting, token, executionTarget, aclP
   let CREATE_VOTES_ROLE, MODIFY_SUPPORT_ROLE, MODIFY_QUORUM_ROLE, UNSAFELY_MODIFY_VOTE_TIME_ROLE
 
@@ -103,7 +103,7 @@ contract('Voting App', ([root, holder1, holder2, holder20, holder29, holder51, n
   })
 
   for (const decimals of [0, 2, 18, 26]) {
-    context(`normal token supply, ${decimals} decimals`, () => {
+      context(`normal token supply, ${decimals} decimals`, () => {
       const neededSupport = pct16(50)
       const minimumAcceptanceQuorum = pct16(20)
 
@@ -124,6 +124,7 @@ contract('Voting App', ([root, holder1, holder2, holder20, holder29, holder51, n
         const script = encodeCallScript([action, action, action])
 
         const voteId = createdVoteId(await voting.newVote(script, '', { from: holder51 }))
+        await voting.vote(voteId, true, true, { from: holder51 })
         await voting.mockIncreaseTime(votingDuration + 1)
         await voting.executeVote(voteId)
 
@@ -132,30 +133,26 @@ contract('Voting App', ([root, holder1, holder2, holder20, holder29, holder51, n
 
       it('execution script can be empty', async () => {
         const voteId = createdVoteId(await voting.newVote(encodeCallScript([]), '', { from: holder51 }))
+        await voting.vote(voteId, true, true, { from: holder51 })
         await voting.mockIncreaseTime(votingDuration + 1)
         await voting.executeVote(voteId)
       })
 
-      it('can create newVote with extended API version', async () => {
-        let voteId = createdVoteId(await voting.methods['newVote(bytes,string,bool,bool)'](encodeCallScript([]), '', false, false, { from: holder51 }))
-        await voting.mockIncreaseTime(votingDuration + 1)
-        await assertRevert(voting.executeVote(voteId), ERRORS.VOTING_CAN_NOT_EXECUTE)
-        assert.equal(await voting.canExecute(voteId), false, 'should be non-executable')
-
-        voteId = createdVoteId(await voting.methods['newVote(bytes,string,bool,bool)'](encodeCallScript([]), '', true, false, { from: holder51 }))
-        await voting.mockIncreaseTime(votingDuration + 1)
-        await voting.executeVote(voteId)
-        assert.equal(await voting.canExecute(voteId), false, 'should be in the executed state')
+      it('check castVote do nothing (deprecated)', async () => {
+        let voteId = createdVoteId(await voting.methods['newVote(bytes,string,bool,bool)'](encodeCallScript([]), '', true, false, { from: holder51 }))
+        assert.equal(await voting.getVoterState(voteId, holder51), VOTER_STATE.ABSENT, 'holder51 should not have voted')
       })
 
       it('check executesIfDecided do nothing (deprecated)', async () => {
         let voteId = createdVoteId(await voting.methods['newVote(bytes,string,bool,bool)'](encodeCallScript([]), '', true, false, { from: holder51 }))
+        await voting.vote(voteId, true, true, { from: holder51 })
         assert.equal(await voting.canExecute(voteId), false, 'should be in the unexecuted state')
         await voting.mockIncreaseTime(votingDuration + 1)
         await voting.executeVote(voteId)
         assert.equal(await voting.canExecute(voteId), false, 'should be in the executed state')
 
         voteId = createdVoteId(await voting.methods['newVote(bytes,string,bool,bool)'](encodeCallScript([]), '', true, true, { from: holder51 }))
+        await voting.vote(voteId, true, true, { from: holder51 })
         assert.equal(await voting.canExecute(voteId), false, 'should be in the unexecuted state')
         await voting.mockIncreaseTime(votingDuration + 1)
         await voting.executeVote(voteId)
@@ -361,7 +358,7 @@ contract('Voting App', ([root, holder1, holder2, holder20, holder29, holder51, n
         })
 
         it('throws when non-holder votes', async () => {
-          await assertRevert(voting.vote(voteId, true, true, { from: nonHolder }), ERRORS.VOTING_CAN_NOT_VOTE)
+          await assertRevert(voting.vote(voteId, true, true, { from: nonHolder }), ERRORS.VOTING_NO_VOTING_POWER)
         })
 
         it('throws when voting after voting closes', async () => {
@@ -410,6 +407,108 @@ contract('Voting App', ([root, holder1, holder2, holder20, holder29, holder51, n
 
           await assertRevert(voting.vote(voteId, true, true, { from: holder20 }), ERRORS.VOTING_CAN_NOT_VOTE)
         })
+      })
+    })
+
+    context('voting for', () => {
+      let script, voteId, creator, metadata
+
+      const neededSupport = pct16(50)
+      const minimumAcceptanceQuorum = pct16(20)
+
+      beforeEach(async () => {
+        token = await MiniMeToken.new(ZERO_ADDRESS, ZERO_ADDRESS, 0, 'n', decimals, 'n', true) // empty parameters minime
+
+        await token.generateTokens(holder20, bigExp(20, decimals))
+        await token.generateTokens(holder29, bigExp(29, decimals))
+        await token.generateTokens(holder51, bigExp(51, decimals))
+        await voting.initialize(token.address, neededSupport, minimumAcceptanceQuorum, votingDuration, 0)
+        await voting.setDelegate(delegate1, {from: holder29})
+        await voting.setDelegate(delegate1, {from: holder51})
+
+        executionTarget = await ExecutionTarget.new()
+
+        const action = {to: executionTarget.address, calldata: executionTarget.contract.methods.execute().encodeABI()}
+        script = encodeCallScript([action, action])
+
+        const receipt = await voting.methods['newVote(bytes,string,bool,bool)'](script, 'metadata', false, false, {from: holder51});
+        voteId = getEventArgument(receipt, 'StartVote', 'voteId')
+        creator = getEventArgument(receipt, 'StartVote', 'creator')
+        metadata = getEventArgument(receipt, 'StartVote', 'metadata')
+      })
+
+
+      it('delegate can vote for voter', async () => {
+        const tx = await voting.voteFor(voteId, false, holder29, {from: delegate1})
+        assertEvent(tx, 'CastVote', {expectedArgs: {voteId: voteId, voter: holder29, supports: false}})
+        assertEvent(tx, 'CastVoteAsDelegate', {expectedArgs: {voteId: voteId, delegate: delegate1, voter: holder29, supports: false}})
+        assertAmountOfEvents(tx, 'CastVote', {expectedAmount: 1})
+        assertAmountOfEvents(tx, 'CastObjection', {expectedAmount: 0})
+        assertAmountOfEvents(tx, 'CastVoteAsDelegate', {expectedAmount: 1})
+
+        const state = await voting.getVote(voteId)
+        const voterState = await voting.getVoterState(voteId, holder29)
+
+        assertBn(state[7], bigExp(29, decimals), 'nay vote should have been counted')
+        assert.equal(voterState, VOTER_STATE.DELEGATE_NAY, 'holder29 should have delegate nay voter status')
+      })
+
+      it('delegate can vote for both voters', async () => {
+        const tx = await voting.voteForMultiple(voteId, false, [holder29, holder51], {from: delegate1})
+        assertEvent(tx, 'CastVote', {expectedArgs: {voteId: voteId, voter: holder29, supports: false}})
+        assertEvent(tx, 'CastVote', {index: 1, expectedArgs: {voteId: voteId, voter: holder51, supports: false}})
+        assertEvent(tx, 'CastVoteAsDelegate', {expectedArgs: {voteId: voteId, delegate: delegate1, voter: holder29, supports: false}})
+        assertEvent(tx, 'CastVoteAsDelegate', {index: 1, expectedArgs: {voteId: voteId, delegate: delegate1, voter: holder51, supports: false}})
+        assertAmountOfEvents(tx, 'CastVote', {expectedAmount: 2})
+        assertAmountOfEvents(tx, 'CastObjection', {expectedAmount: 0})
+        assertAmountOfEvents(tx, 'CastVoteAsDelegate', {expectedAmount: 2})
+
+        const state = await voting.getVote(voteId)
+        assertBn(state[7], bigExp(80, decimals), 'nay vote should have been counted')
+
+        const voterState29 = await voting.getVoterState(voteId, holder29)
+        assert.equal(voterState29, VOTER_STATE.DELEGATE_NAY, 'holder29 should have delegate nay voter status')
+
+        const voterState51 = await voting.getVoterState(voteId, holder51)
+        assert.equal(voterState51, VOTER_STATE.DELEGATE_NAY, 'holder51 should have delegate nay voter status')
+      })
+
+      it(`delegate can't vote for both voters if one has previously voted`, async () => {
+        await voting.vote(voteId, false, true, { from: holder29 })
+        await assertRevert(
+          voting.voteForMultiple(voteId, false, [holder29, holder51], {from: delegate1}),
+          ERRORS.VOTING_CAN_NOT_VOTE_FOR
+        )
+      })
+
+      it(`voter can overwrite delegate's vote`, async () => {
+        await voting.voteFor(voteId, false, holder29, {from: delegate1})
+
+        const tx = await voting.vote(voteId, true, true, {from: holder29})
+        assertEvent(tx, 'CastVote', {expectedArgs: {voteId: voteId, voter: holder29, supports: true}})
+        assertAmountOfEvents(tx, 'CastVote', {expectedAmount: 1})
+        assertAmountOfEvents(tx, 'CastObjection', {expectedAmount: 0})
+
+        const state = await voting.getVote(voteId)
+        assertBn(state[6], bigExp(29, decimals), 'yea vote should have been counted')
+        assertBn(state[7], bigExp(0, decimals), 'nay vote should have been reset')
+
+        const voterState29 = await voting.getVoterState(voteId, holder29)
+        assert.equal(voterState29, VOTER_STATE.YEA, 'holder29 should have yea voter status')
+      })
+
+      it(`delegate can't overwrite voter's vote`, async () => {
+        await voting.voteFor(voteId, false, holder29, {from: delegate1})
+        await voting.vote(voteId, true, true, {from: holder29})
+
+        await assertRevert(
+            voting.voteFor(
+                voteId,
+                false,
+                holder29,
+                { from: delegate1 }
+            ), ERRORS.VOTING_CAN_NOT_VOTE_FOR
+        )
       })
     })
   }
@@ -795,6 +894,94 @@ contract('Voting App', ([root, holder1, holder2, holder20, holder29, holder51, n
 
       assert.isFalse(voteState[0], 'vote should be closed after time increasing')
       assert.isTrue(voteState[1], 'vite should be executed')
+    })
+  })
+
+  context('voting delegate', () => {
+    const neededSupport = pct16(50)
+    const minimumAcceptanceQuorum = pct16(20)
+    const decimals = 18
+
+    beforeEach(async () => {
+      token = await MiniMeToken.new(ZERO_ADDRESS, ZERO_ADDRESS, 0, 'n', decimals, 'n', true) // empty parameters minime
+
+      await token.generateTokens(holder20, bigExp(20, decimals))
+      await token.generateTokens(holder29, bigExp(29, decimals))
+      await token.generateTokens(holder51, bigExp(51, decimals))
+      await voting.initialize(token.address, neededSupport, minimumAcceptanceQuorum, votingDuration, 0)
+
+      executionTarget = await ExecutionTarget.new()
+    })
+
+    it('voter can set delegate', async () => {
+      const tx = await voting.setDelegate(delegate1, {from: holder29})
+      assertEvent(tx, 'SetDelegate', {
+        expectedArgs: {voter: holder29, delegate: delegate1}
+      })
+      assertAmountOfEvents(tx, 'SetDelegate', {expectedAmount: 1})
+
+      const delegate = await voting.getDelegate(holder29)
+      assert.equal(delegate, delegate1, 'holder29 should have delegate1 as a delegate')
+
+      const delegatedVoters = (await voting.getDelegatedVoters(delegate1, 0, 1))[0]
+      assertArraysEqualAsSets(delegatedVoters, [holder29], 'delegate1 should be a delegate of holder29')
+    })
+
+    it('voter can remove delegate', async () => {
+      await voting.setDelegate(delegate1, {from: holder29})
+
+      const tx = await voting.removeDelegate({from: holder29})
+      assertEvent(tx, 'RemoveDelegate', {
+        expectedArgs: {voter: holder29, delegate: delegate1}
+      })
+      assertAmountOfEvents(tx, 'RemoveDelegate', {expectedAmount: 1})
+      const delegatedVoters = (await voting.getDelegatedVoters(delegate1, 0, 1))[0]
+      assertArraysEqualAsSets(delegatedVoters, [], 'delegate1 should not be a delegate of anyone')
+    })
+
+    it('voters can remove delegate', async () => {
+      await voting.setDelegate(delegate1, {from: holder20})
+      await voting.setDelegate(delegate1, {from: holder29})
+      await voting.setDelegate(delegate1, {from: holder51})
+
+
+      const tx1 = await voting.removeDelegate({from: holder29})
+      assertEvent(tx1, 'RemoveDelegate', {
+        expectedArgs: {voter: holder29, delegate: delegate1}
+      })
+      assertAmountOfEvents(tx1, 'RemoveDelegate', {expectedAmount: 1})
+      const tx2 = await voting.removeDelegate({from: holder51})
+      assertEvent(tx2, 'RemoveDelegate', {
+        expectedArgs: {voter: holder51, delegate: delegate1}
+      })
+      assertAmountOfEvents(tx2, 'RemoveDelegate', {expectedAmount: 1})
+      const delegatedVoters = (await voting.getDelegatedVoters(delegate1, 0, 1))[0]
+      assertArraysEqualAsSets(delegatedVoters, [holder20], 'delegate1 have only holder20 as a delegated voter')
+    })
+
+    it('voter can change delegate', async () => {
+      await voting.setDelegate(delegate1, {from: holder29})
+      await voting.setDelegate(delegate2, {from: holder51})
+
+      await voting.setDelegate(delegate2, {from: holder29})
+
+      const delegatedVotersDelegate1 = (await voting.getDelegatedVoters(delegate1, 0, 1))[0]
+      assertArraysEqualAsSets(delegatedVotersDelegate1, [], 'delegate1 should not be a delegate of anyone')
+      const delegatedVotersDelegate2 = (await voting.getDelegatedVoters(delegate2, 0, 2))[0]
+      assertArraysEqualAsSets(delegatedVotersDelegate2, [holder29, holder51], 'delegate2 should be a delegate of holder29 and holder51')
+    })
+
+    it('delegate can manage several voters', async () => {
+      await voting.setDelegate(delegate1, {from: holder29})
+
+      const tx = await voting.setDelegate(delegate1, {from: holder51})
+      assertEvent(tx, 'SetDelegate', {
+        expectedArgs: {voter: holder51, delegate: delegate1}
+      })
+      assertAmountOfEvents(tx, 'SetDelegate', {expectedAmount: 1})
+
+      const delegatedVoters = (await voting.getDelegatedVoters(delegate1, 0, 2))[0]
+      assertArraysEqualAsSets(delegatedVoters, [holder29, holder51], 'delegate1 should be a delegate of holder29 and holder51')
     })
   })
 })
